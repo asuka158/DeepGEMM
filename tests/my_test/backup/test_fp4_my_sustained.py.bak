@@ -1,0 +1,208 @@
+"""
+MXFP4 x MXFP4 dense GEMM benchmark (reproduces the dense table of PR #348).
+
+Based on test_gemm() in tests/test_fp4.py. For every shape in shape.txt it:
+  1. generates bf16 inputs, casts both operands to MXFP4 (E2M1 + UE8M0 VS=32 scales),
+  2. runs the SM100_MMA_MXF4_SS dense kernel via deep_gemm.fp8_fp4_gemm_nt,
+  3. checks correctness against the fp32 reference (calc_diff < 0.02),
+  4. times the kernel with bench_kineto,
+and writes the results to tests/result/<...>.csv.
+
+NOTE: the FP4xFP4 path has no bf16 epilogue (csrc/apis/gemm.hpp asserts fp32 D),
+so the output D is fp32 -- bf16 writeback is not supported by this kernel yet.
+
+Run (the LD_LIBRARY_PATH prefix fixes the container's torch/libucs import issue):
+  cd <repo>/tests/my_test
+  LD_LIBRARY_PATH=/opt/hpcx/ucx/lib PYTHONPATH=<repo> python test_fp4_my.py
+"""
+import csv
+import os
+import random
+import sys
+import time
+
+import torch
+
+# Make `deep_gemm` and the shared test `generators` importable regardless of CWD.
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_TESTS_DIR = os.path.dirname(_THIS_DIR)
+_REPO_DIR = os.path.dirname(_TESTS_DIR)
+for p in (_REPO_DIR, _TESTS_DIR):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+import pynvml
+
+import deep_gemm
+from deep_gemm.testing import bench_kineto, calc_diff, count_bytes
+
+from generators import KernelType, MajorTypeAB, QuantConfig, generate_normal
+
+
+# FP4xFP4 (MXFP4): both operands packed FP4 (E2M1) with VS=32 UE8M0 scales.
+# Dispatches to the SM100_MMA_MXF4_SS path; the API rejects bf16 D so D is fp32.
+FP4_FP4 = QuantConfig((32, 32, True, True))
+
+
+# ---------------------------------------------------------------------------
+# Sustained-load probe (CUDA-Graph based) -- separate from bench_kineto.
+#
+# bench_kineto flushes 8 GB of L2 before every call, so the SMs idle between
+# kernels and the GPU stays at peak clock -> its `tflops` is the peak-clock,
+# single-kernel throughput (same methodology as PR #348). This probe instead
+# runs the kernel flat out (no flush) to report the *sustained* throughput plus
+# the clock/power seen during it, all from one run.
+#
+# We capture R kernels into a CUDA graph and replay it. The graph does two
+# things for us at once:
+#   * removes per-launch CPU overhead, so small/fast shapes are no longer
+#     launch-bound (a plain Python loop under-counts them badly), and
+#   * each replay() queues R kernels (~a few ms of GPU work), so the GPU never
+#     drains while the CPU does the slow NVML reads -- letting us TIME and
+#     SAMPLE in a single pass without the NVML stalls polluting the timing.
+# ---------------------------------------------------------------------------
+def init_nvml(device_index: int = 0):
+    pynvml.nvmlInit()
+    return pynvml.nvmlDeviceGetHandleByIndex(device_index)
+
+
+def probe_sustained(fn, handle, flops: float, t_hint: float,
+                    warmup_s: float = 0.8, sample_s: float = 0.3):
+    """Return (tflops_sustained, avg_sm_clock_mhz, avg_power_w) at STEADY STATE.
+
+    Under continuous load the GPU boosts to peak clock for the first ~0.1 s (the
+    power budget is not yet used up) and only settles into its power-capped
+    steady-state clock after ~0.6-0.8 s. Measuring too early reports a transient
+    boost, not a sustainable rate -- so we replay for `warmup_s` first to reach
+    steady state, then time + sample over `sample_s`. All three returned numbers
+    then describe the same steady-state regime.
+    """
+    # Pick R so one replay is ~3 ms of GPU work: long enough that an NVML read
+    # cannot drain the queue, capped to keep graph capture cheap.
+    replays = min(256, max(8, int(0.003 / t_hint)))
+
+    # Warm up (JIT compile + autotune) before capture.
+    for _ in range(10):
+        fn()
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(replays):
+            fn()
+
+    # Sustained warmup: replay until the clock/power settle into steady state.
+    start = time.time()
+    while time.time() - start < warmup_s:
+        graph.replay()
+    torch.cuda.synchronize()
+
+    # Single pass: time the whole replay loop with events while sampling NVML.
+    clocks, powers = [], []
+    start_ev = torch.cuda.Event(enable_timing=True)
+    end_ev = torch.cuda.Event(enable_timing=True)
+    n_replay = 0
+    start_ev.record()
+    start = time.time()
+    while time.time() - start < sample_s:
+        graph.replay()
+        n_replay += 1
+        clocks.append(pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM))
+        powers.append(pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0)
+    end_ev.record()
+    torch.cuda.synchronize()
+
+    per_call_s = start_ev.elapsed_time(end_ev) / 1e3 / (n_replay * replays)
+    tflops_sustained = flops / per_call_s / 1e12
+    return tflops_sustained, sum(clocks) / len(clocks), sum(powers) / len(powers)
+
+
+def read_shapes(path):
+    shapes = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.lower().startswith('m'):  # skip header / blanks
+                continue
+            m, n, k = (int(x) for x in line.split())
+            shapes.append((m, n, k))
+    return shapes
+
+
+def main():
+    torch.manual_seed(0)
+    random.seed(0)
+
+    shape_path = os.path.join(_THIS_DIR, 'shape.txt')
+    result_dir = os.path.join(_TESTS_DIR, 'result')
+    os.makedirs(result_dir, exist_ok=True)
+    csv_path = os.path.join(result_dir, 'fp4_dense_gemm_bench.csv')
+
+    shapes = read_shapes(shape_path)
+    kernel_type = KernelType.Kernel1D1D
+    out_dtype = torch.float  # FP4xFP4 kernel only supports fp32 D
+    recipe, recipe_a, recipe_b = FP4_FP4.get_recipes()
+    nvml_handle = init_nvml(0)
+
+    print(f'Library path: {deep_gemm.__path__[0]}')
+    print(f'Device: {torch.cuda.get_device_name(0)}')
+    print(f'Benchmarking {len(shapes)} shapes (MXFP4 x MXFP4 dense GEMM, NT, fp32 D)\n')
+
+    rows = []
+    for idx, (m, n, k) in enumerate(shapes):
+        a, b, c, d, ref_d = generate_normal(
+            m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor,
+            accumulate=False, out_dtype=out_dtype, kernel_type=kernel_type,
+            use_ue8m0=True, quant_config=FP4_FP4)
+
+        deep_gemm.fp8_fp4_gemm_nt(
+            a, b, d, c=c, disable_ue8m0_cast=False,
+            recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b)
+
+        diff = calc_diff(d, ref_d)
+        ok = diff < FP4_FP4.max_diff()
+
+        t = bench_kineto(
+            lambda: deep_gemm.fp8_fp4_gemm_nt(
+                a, b, d, c=c, disable_ue8m0_cast=False,
+                recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b),
+            'sm100_fp4_gemm', suppress_kineto_output=True)
+
+        tflops = 2 * m * n * k / t / 1e12
+        gbps = count_bytes(a, b, d) / 1e9 / t
+
+        # Sustained-load probe: tflops_sustained + the clock/power during it,
+        # all from one flat-out run (see probe_sustained docstring).
+        tflops_sustained, sm_mhz, power_w = probe_sustained(
+            lambda: deep_gemm.fp8_fp4_gemm_nt(
+                a, b, d, c=c, disable_ue8m0_cast=False,
+                recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b),
+            nvml_handle, flops=2 * m * n * k, t_hint=t)
+
+        rows.append(dict(m=m, n=n, k=k, time_us=t * 1e6, tflops=tflops,
+                         tflops_sustained=tflops_sustained, gbps=gbps,
+                         sm_mhz=sm_mhz, power_w=power_w, diff=diff, correct=ok))
+        print(f' [{idx + 1:2}/{len(shapes)}] m={m:6} n={n:6} k={k:6} | '
+              f'{t * 1e6:8.1f} us | {tflops:6.0f} TFLOPS | '
+              f'sust {tflops_sustained:6.0f} | {gbps:6.0f} GB/s | '
+              f'{sm_mhz:5.0f} MHz | {power_w:6.0f} W | '
+              f'diff={diff:.5f} {"OK" if ok else "FAIL"}')
+
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['m', 'n', 'k', 'time_us', 'tflops', 'tflops_sustained',
+                         'gbps', 'sm_mhz', 'power_w', 'diff', 'correct'])
+        for r in rows:
+            writer.writerow([r['m'], r['n'], r['k'],
+                             f"{r['time_us']:.3f}", f"{r['tflops']:.2f}",
+                             f"{r['tflops_sustained']:.2f}", f"{r['gbps']:.2f}",
+                             f"{r['sm_mhz']:.0f}", f"{r['power_w']:.1f}",
+                             f"{r['diff']:.6f}", int(r['correct'])])
+
+    n_ok = sum(r['correct'] for r in rows)
+    print(f'\nDone. {n_ok}/{len(rows)} shapes passed correctness.')
+    print(f'Results written to {csv_path}')
+
+
+if __name__ == '__main__':
+    main()
