@@ -13,6 +13,7 @@ from generators import (
 # FP4xFP4 (MXFP4): both operands packed FP4 (E2M1) with VS=32 UE8M0 scales.
 # Dispatches to the SM100_MMA_MXF4_SS path; the API rejects bf16 D so we
 # always allocate fp32 D below.
+# QuantConfig(gran_k_a, gran_k_b, is_fp4_a, is_fp4_b)
 FP4_FP4 = QuantConfig((32, 32, True, True))
 
 
@@ -23,17 +24,17 @@ def test_gemm() -> None:
     m_list = [128, 4096]
     kernel_type = KernelType.Kernel1D1D
     out_dtype = torch.float
-    recipe, recipe_a, recipe_b = FP4_FP4.get_recipes()
+    recipe, recipe_a, recipe_b = FP4_FP4.get_recipes() # None; (1, 32); (1, 32)
 
     for m in m_list:
         for n, k in nk_list:
             a, b, c, d, ref_d = generate_normal(
                 m, n, k, MajorTypeAB.KMajor, MajorTypeAB.KMajor,
                 accumulate=False, out_dtype=out_dtype, kernel_type=kernel_type,
-                use_ue8m0=True, quant_config=FP4_FP4)
+                use_ue8m0=True, quant_config=FP4_FP4)   # KMajor 是行主序的意思
             deep_gemm.fp8_fp4_gemm_nt(
                 a, b, d, c=c, disable_ue8m0_cast=False,
-                recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b)
+                recipe=recipe, recipe_a=recipe_a, recipe_b=recipe_b) # disable_ue8m0_cast=False 表示 c++ 侧要打包成 int32，和前面 use_ue8m0 = True 对应
             diff = calc_diff(d, ref_d)
             assert diff < FP4_FP4.max_diff(), \
                 f'{m=}, {n=}, {k=}, {diff:.5f}'

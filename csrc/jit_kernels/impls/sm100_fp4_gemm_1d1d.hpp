@@ -244,28 +244,29 @@ static GemmDesc make_fp4_desc(GemmType gemm_type, int m, int n, int k, int num_g
     };
 }
 
-static void sm100_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
-                                const torch::Tensor& b, const torch::Tensor& sfb,
-                                const std::optional<torch::Tensor>& c,
-                                const torch::Tensor& d,
-                                const int& m, const int& n, const int& k,
-                                const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+// host侧：决定 tile 形状、stage 数、swizzle、构造 5 个 TMA 描述符
+static void sm100_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,   // a: int8[m, k // 2], kmajor; sfa: int32[m, k // 32 // 4], mnmajor
+                                const torch::Tensor& b, const torch::Tensor& sfb,   // b: int8[n, k // 2], kmajor; sfb: int32[n, k // 32 // 4], mnmajor
+                                const std::optional<torch::Tensor>& c,              // c: none / fp32[m, n], nmajor
+                                const torch::Tensor& d,                             // d: fp32[m, n], nmajor
+                                const int& m, const int& n, const int& k,           // scalar
+                                const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, // kmajor
                                 const std::string& compiled_dims) {
     constexpr int gran_k = 32;
     const auto desc = make_fp4_desc(GemmType::Normal, m, n, k, 1,
                                     major_a, major_b, d.scalar_type(),
-                                    c.has_value(), compiled_dims);
+                                    c.has_value(), compiled_dims);          // 问题描述
     const auto layout = pick_fp4_layout(GemmType::Normal, m, n, k, 1,
-                                        device_runtime->get_num_sms());
+                                        device_runtime->get_num_sms());     // tile 启发式
     auto config = GemmConfig{
         .layout = layout,
-        .storage_config = SM100ArchSpec::get_storage_config(desc, layout),
+        .storage_config = SM100ArchSpec::get_storage_config(desc, layout),  // load/store 块、swizzle 模式
         .pipeline_config = {},
-        .launch_config = SM100ArchSpec::get_launch_config(desc, layout),
+        .launch_config = SM100ArchSpec::get_launch_config(desc, layout),    // 线程数、SM 数
     };
     config.pipeline_config = SM100ArchSpec::get_pipeline_config(desc, layout, config.storage_config);
     const auto [new_stages, new_smem] = recompute_stages_for_fp4(config, layout.block_m, layout.block_n, k);
-    config.pipeline_config.num_stages = new_stages;
+    config.pipeline_config.num_stages = new_stages;     // 修正 stage 数
     config.pipeline_config.smem_size = new_smem;
 
     // View FP4-packed-int8 tensors as int32 (8 FP4 per int32). Same memory

@@ -48,28 +48,30 @@ static bool early_return(const int& m, const int &n, const int& k,
 
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
 
-static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
-                            const std::pair<torch::Tensor, torch::Tensor>& b,
-                            const torch::Tensor& d,
-                            const std::optional<torch::Tensor>& c,
-                            std::optional<std::tuple<int, int, int>> recipe,
-                            std::optional<std::tuple<int, int>> recipe_a,
-                            std::optional<std::tuple<int, int>> recipe_b,
-                            const std::string& compiled_dims,
-                            const bool& disable_ue8m0_cast) {
+static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,   // A = (packed_fp4 int8, sfa fp32)
+                            const std::pair<torch::Tensor, torch::Tensor>& b,   // B = (packed_fp4, sfb)
+                            const torch::Tensor& d,                             // 输出 D
+                            const std::optional<torch::Tensor>& c,              // 可选累加 C
+                            std::optional<std::tuple<int, int, int>> recipe,    // 旧式三元 recipe
+                            std::optional<std::tuple<int, int>> recipe_a,       // (gran_mn, gran_k)=(1,32)
+                            std::optional<std::tuple<int, int>> recipe_b,       // (1,32)
+                            const std::string& compiled_dims,                   // "nk"
+                            const bool& disable_ue8m0_cast) {                   // false
+    
+    // 1. 参数检查                            
     // Shape must be `[M, K] @ [N, K].T`
-    const auto major_a = get_major_type_ab(a.first);
+    const auto major_a = get_major_type_ab(a.first);    // 从 stride 推断 A 是 K-major 还是 MN-major
     const auto major_b = get_major_type_ab(b.first);
     if (fp8_requires_k_major()) {
-        DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);
+        DG_HOST_ASSERT(major_a == cute::UMMA::Major::K);    // SM100 要求 K-major
         DG_HOST_ASSERT(major_b == cute::UMMA::Major::K);
     }
 
     // C/D must be N-major
-    check_major_type_cd(d);
+    check_major_type_cd(d);     // D/C 必须 N-major
 
     // Type and shape checks
-    const auto arch_major = device_runtime->get_arch_major();
+    const auto arch_major = device_runtime->get_arch_major();       // 10 = SM100/Blackwell
     const auto [m , k ] = check_ab_fp8_fp4(a.first, major_a, arch_major);
     const auto [n , k_] = check_ab_fp8_fp4(b.first, major_b, arch_major);
     const auto [m_, n_] = get_shape<2>(d);
@@ -85,10 +87,15 @@ static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
     if (early_return(m, n, k, d, c))
         return;
 
+    // 2. sfa、sfb transform
     // Transform SFA and SFB into compute-required layout
+    // float32 [128, 224] → packed int32 UE8M0 [128, 56]
+    // kmajor → mnmajor
+    // sfa[row][col] =  sfa + row * 224 + col → sfa[row][col] = sfa+col*128+row
     const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
         a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, std::nullopt, disable_ue8m0_cast);
 
+    // 3. impls
     // Dispatch into different implements
     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
         const int gran_n = recipe.has_value() ? std::get<1>(recipe.value()) : std::get<0>(recipe_b.value());

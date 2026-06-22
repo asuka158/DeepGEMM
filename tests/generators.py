@@ -261,7 +261,7 @@ def grouped_cast_fp8_fp4_with_major(x: torch.Tensor, major: MajorTypeAB, gran_k:
                                        else per_token_cast_to_fp8(x[i], use_ue8m0=use_ue8m0, gran_k=gran_k)
         return x_fp8 if major.is_k_major() else (x_fp8[0].mT.contiguous().mT, x_fp8[1])
 
-
+# 造一对随机 bf16 矩阵 → 先用全精度算出参考答案 `ref_d` → 再把 A、B 量化成 (FP4, SF) 对返回。
 def generate_normal(m: int, n: int, k: int,
                     major_a: MajorTypeAB, major_b: MajorTypeAB,
                     accumulate: bool, out_dtype: torch.dtype,
@@ -281,9 +281,9 @@ def generate_normal(m: int, n: int, k: int,
         return a, b, c, d, ref_d
     
     quant_config = QuantConfig() if quant_config is None else quant_config
-    a = cast_fp8_fp4_with_major(a, major_a, quant_config.gran_k_a, quant_config.is_fp4_a, use_ue8m0)
+    a = cast_fp8_fp4_with_major(a, major_a, quant_config.gran_k_a, quant_config.is_fp4_a, use_ue8m0)    # a:Tuple[Tensor, Tensor] (packed_fp4 int8, sf float32)
     b = cast_fp8_fp4_with_major(b, major_b, quant_config.gran_k_b, quant_config.is_fp4_b, use_ue8m0,
-                                use_block_cast_for_fp8=not (kernel_type.is_1d1d() and accumulate))
+                                use_block_cast_for_fp8=not (kernel_type.is_1d1d() and accumulate))      # b:Tuple[Tensor, Tensor] (packed_fp4 int8, sf float32)
 
     return a, b, c, d, ref_d
 

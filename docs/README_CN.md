@@ -212,3 +212,77 @@ DeepGEMM 受 [CUTLASS](https://github.com/nvidia/cutlass) 项目启发。向其�
       howpublished = {\url{https://github.com/deepseek-ai/DeepGEMM}},
 }
 ```
+
+## 源码目录
+
+DeepGEMM 的代码大致分为四层，理解它们之间的关系是读懂整个项目的关键：
+
+1. **Python 接口层**（`deep_gemm/`）：用户直接 `import deep_gemm` 调用的入口，绝大多数算子其实只是 C++ 扩展 `_C` 的薄封装。
+2. **C++ 主机层**（`csrc/`）：编译成 `_C.so`，负责参数校验、形状/配置启发式选择，以及在运行时把设备端内核 **即时编译（JIT）** 并发射（launch）出去。它本身**不**包含 CUDA kernel 的计算逻辑。
+3. **设备端内核源码**（`deep_gemm/include/deep_gemm/`）：真正的 `.cuh` CUDA kernel 模板，在 JIT 阶段被主机层以源码方式 `#include` 进来现场编译。这一层才是 Tensor Core 计算发生的地方。
+4. **测试 / 实验 / 三方依赖**（`tests/`、`exp/`、`scripts/`、`third-party/`）。
+
+```text
+DeepGEMM/
+├── deep_gemm/                      # ① Python 接口层（pip 安装后的包）
+│   ├── __init__.py                 #   从 _C 导出所有算子（fp8_fp4_gemm_nt 等），并设置环境变量
+│   ├── _C.*.so                     #   由 csrc/ 编译出的 C++ 扩展（实际入口）
+│   ├── include/deep_gemm/          # ③ 设备端 CUDA 内核源码（JIT 现场编译，非预编译）
+│   │   ├── impls/                  #   各内核的完整实现（一个文件 = 一个 kernel）
+│   │   │   ├── sm100_fp4_gemm_1d1d.cuh      # ★ 4bit(FP4xFP4) GEMM 的设备端内核
+│   │   │   ├── sm100_fp8_fp4_gemm_1d1d.cuh  #   FP8xFP4 混合精度 GEMM
+│   │   │   ├── sm100_bf16_gemm.cuh / sm90_*.cuh ...  # BF16 / FP8 / SM90 各架构变体
+│   │   │   ├── sm100_fp8_fp4_mega_moe.cuh   #   融合 + 通信重叠的 Mega MoE 超级内核
+│   │   │   └── *_mqa_logits.cuh             #   索引器 MQA 评分内核（分页/非分页）
+│   │   ├── mma/                    #   Tensor Core 矩阵乘原语封装（sm100=tcgen05, sm90=wgmma）
+│   │   ├── ptx/                    #   底层 PTX 内联汇编（tcgen05 / wgmma / tma / ld_st）
+│   │   ├── scheduler/              #   tile 调度器（GEMM / Mega MoE / 分页 MQA 的分块映射）
+│   │   ├── epilogue/              #   尾段：累加器→输出的转换与写回（含 swap-AB）
+│   │   ├── common/                 #   通用工具：类型、数学、reduction、TMA 拷贝、sm100/sm90 helper
+│   │   ├── comm/                   #   设备端通信原语（barrier，用于 Mega MoE 的 NVLink 重叠）
+│   │   └── layout/                 #   设备端布局变换（对称内存缓冲区、Mega MoE 权重布局）
+│   ├── testing/                    #   测试/基准辅助：bench_kineto、calc_diff、count_bytes
+│   ├── utils/                      #   Python 侧工具：布局/数学/分布式辅助
+│   ├── legacy/                     #   旧版分组 GEMM API（保留兼容）
+│   └── mega/                       #   Mega MoE 的 Python 侧封装
+│
+├── csrc/                           # ② C++ 主机层（编译为 _C.so）
+│   ├── python_api.cpp              #   pybind11 入口，逐个调用各 apis/ 的 register_apis()
+│   ├── apis/                       #   面向 Python 的算子声明与参数校验、NT/NN/TN/TT 派发
+│   │   ├── gemm.hpp                # ★ fp8_fp4_gemm_nt 等 GEMM 入口在此定义
+│   │   ├── attention.hpp           #   MQA logits 索引器入口
+│   │   ├── mega.hpp / einsum.hpp / hyperconnection.hpp / layout.hpp / runtime.hpp
+│   ├── jit_kernels/                #   主机侧的“内核发射器”：选配置 + 拼装 + launch
+│   │   ├── impls/                  #   每个 kernel 的主机端发射逻辑（与 include/impls 一一对应）
+│   │   │   ├── sm100_fp4_gemm_1d1d.hpp      # ★ FP4 GEMM 的主机侧 launch 代码
+│   │   │   └── ...                          #   其余 GEMM / MoE / MQA 的发射器
+│   │   └── heuristics/             #   形状→分块配置的启发式（sm100.hpp / sm90.hpp / config.hpp ...）
+│   ├── jit/                        #   JIT 引擎：编译器调用、内核缓存、设备运行时、句柄管理
+│   ├── utils/                      #   主机侧工具：异常、格式化、哈希、布局、数学
+│   └── indexing/main.cu            #   汇总 include 所有 .cuh 的占位 main（供 IDE/编译检查）
+│
+├── tests/                          # ④ 测试与示例（也是最好的用法参考）
+│   ├── test_fp4.py                 # ★ 本文示例：FP4xFP4 稠密 / 分组(连续/掩码) GEMM
+│   ├── test_fp8_fp4.py / test_bf16.py / test_mega_moe.py / test_attention.py ...
+│   ├── generators.py               #   各类测试输入生成器（量化、布局、分组）与 KernelType 枚举
+│   └── my_test/, test_stablesm_rand/  #   自定义/稳定性基准脚本
+│
+├── exp/                            #   性能实验脚本与结果（kineto、频率扫描、event vs graph 等）
+├── scripts/                        #   辅助脚本（生成 .pyi、绘图、ncu profiling）
+├── docs/                           #   文档（含本 README_CN.md）
+├── third-party/                    #   子模块：cutlass / cute、fmt、tilelang_ops
+├── develop.sh / install.sh / build.sh   #   构建脚本（develop.sh 链接 CUTLASS 头并编译 _C）
+└── setup.py / CMakeLists.txt       #   构建配置
+```
+
+### 以 4bit GEMM 为例的调用链
+
+仍以正在阅读的 `tests/test_fp4.py` 为例，看一次 `deep_gemm.fp8_fp4_gemm_nt(...)` 调用是如何从 Python 一路走到 Tensor Core 的（标 ★ 的是上面目录中对应的关键文件）：
+
+1. **测试脚本** `tests/test_fp4.py::test_gemm` 用 `generators.py` 生成打包好的 FP4（E2M1）输入 `a`、`b` 与各自的 UE8M0 缩放因子，然后调用 `deep_gemm.fp8_fp4_gemm_nt(a, b, d, ...)`。
+2. **Python 接口** `deep_gemm/__init__.py` 中的 `fp8_fp4_gemm_nt` 实际是从 C++ 扩展 `._C` 导入的符号，调用即进入 `_C.so`。
+3. **C++ 入口** `csrc/apis/gemm.hpp::fp8_fp4_gemm_nt`（由 `python_api.cpp` → `gemm::register_apis` 注册）完成形状/布局校验，并把 NT/NN/TN/TT 等布局统一规约后，派发到 `sm100_fp4_gemm_1d1d(...)`。
+4. **主机发射器** `csrc/jit_kernels/impls/sm100_fp4_gemm_1d1d.hpp` 先经 `heuristics/sm100.hpp` 依据 `(m, n, k)` 选出分块大小等配置，再通过 `csrc/jit/` 的 JIT 引擎，把设备端内核源码**现场编译**成可执行 kernel（首次会编译，之后命中缓存），并设置好 TMA 描述符、grid/block 后发射。
+5. **设备端内核** `deep_gemm/include/deep_gemm/impls/sm100_fp4_gemm_1d1d.cuh` 在 GPU 上执行真正的计算：用 `scheduler/gemm.cuh` 做 tile 调度，用 `mma/sm100.cuh` + `ptx/tcgen05.cuh` 驱动 SM100 的 `tcgen05` Tensor Core 完成 FP4 矩阵乘累加，最后由 `epilogue/` 把累加结果写回 `d`。
+
+因此，**“想看某个算子怎么用”就去 `tests/`；“想看它的接口与参数”就去 `csrc/apis/`；“想看它怎么选配置、怎么发射”就去 `csrc/jit_kernels/`；“想看 Tensor Core 上真正的计算逻辑”就去 `deep_gemm/include/deep_gemm/impls/`。** 同一个内核在这几层里通常同名（如 `sm100_fp4_gemm_1d1d`），顺着名字即可串起整条链路。
