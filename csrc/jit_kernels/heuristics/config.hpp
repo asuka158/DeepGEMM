@@ -10,20 +10,20 @@ namespace deep_gemm {
 
 /// GEMM descriptors
 struct GemmDesc {
-    GemmType gemm_type;
-    KernelType kernel_type;
-    int m, n, k, num_groups;
-    at::ScalarType a_dtype, b_dtype, cd_dtype;
+    GemmType gemm_type;         // Normal、MGroupedContigous、MGroupedMasked、KGroupedContiguous
+    KernelType kernel_type;     // Kernel1D1D/ 1D2D / NoSF
+    int m, n, k, num_groups;    
+    at::ScalarType a_dtype, b_dtype, cd_dtype;  // ab: torch::kBFloat16、torch::kFloat8_e4m3fn、kPackedFP4; cd: torch::kBFloat16, torch::kFloat
     cute::UMMA::Major major_a;
     cute::UMMA::Major major_b;
-    bool with_accumulation;
+    bool with_accumulation;     // true: D = A @ B + C; false: D = A @ B
 
     // Requirements from users
     int num_sms, tc_util;
     std::string compiled_dims;
 
     // Shape for heuristic generation
-    int expected_m = 0, expected_n = 0, expected_k = 0, expected_num_groups = 0;
+    int expected_m = 0, expected_n = 0, expected_k = 0, expected_num_groups = 0;    // 每个group中mnk的期望
     int get_expected_m() const { return expected_m > 0 ? expected_m : m; }
     int get_expected_n() const { return expected_n > 0 ? expected_n : n; }
     int get_expected_k() const { return expected_k > 0 ? expected_k : k; }
@@ -71,7 +71,7 @@ struct GemmDesc {
 /// GEMM configs
 struct Layout {
     int swap_ab;
-    int block_m, block_n, block_k;
+    int block_m, block_n, block_k;  // 一个 tile 的 shape, k的单位是byte，mn是元素数量
     int cluster_m, cluster_n;
 
     int get_cluster_size() const {

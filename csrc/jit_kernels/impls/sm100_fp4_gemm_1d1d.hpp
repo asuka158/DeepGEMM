@@ -127,6 +127,7 @@ static std::pair<int, int> recompute_stages_for_fp4(const GemmConfig& config, in
     return {new_num_stages, new_smem_size};
 }
 
+// 给定(m,n,k,num_groups) 和 nums_sm, 挑选 block_n、cluster_m/n、swap_ab
 // FP4xFP4 Layout selector:
 //   block_m = 128 (UMMA_M for MXF4); block_k = 128 bytes (32 packed int32 = 256 FP4).
 //   block_n: pick by wave count + composite score = est_stages^2 * bn, with a
@@ -139,8 +140,8 @@ static Layout pick_fp4_layout(const GemmType& gemm_type,
                               const int& num_groups, const int& num_sms,
                               const int& expected_m_per_group = INT_MAX) {
     constexpr int block_m = 128;
-    constexpr int block_k_bytes = 128;  // 32 packed int32 = 256 FP4 elements per K block
-    constexpr int sf_pk = 2;             // block_k_int32 / 16 = 32/16
+    constexpr int block_k_bytes = 128;   // 32 packed int32 = 256 FP4 elements per K block
+    constexpr int sf_pk = 2;             // 一个 block_k 在 K 方向上需要几个 int32 的 scale，256 / 32 / 4 = 2
     constexpr int sf_block_m_cols = (128 / 32) * sf_pk;  // 8
     constexpr int smem_capacity = 232448;
 
@@ -252,12 +253,15 @@ static void sm100_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
                                 const int& m, const int& n, const int& k,           // scalar
                                 const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b, // kmajor
                                 const std::string& compiled_dims) {
+    // 1. 问题描述 GemmDesc
     constexpr int gran_k = 32;
     const auto desc = make_fp4_desc(GemmType::Normal, m, n, k, 1,
                                     major_a, major_b, d.scalar_type(),
-                                    c.has_value(), compiled_dims);          // 问题描述
+                                    c.has_value(), compiled_dims);     
+    // 2. tile 启发式（block_m、block_n、cluster、warp_ab）                                      
     const auto layout = pick_fp4_layout(GemmType::Normal, m, n, k, 1,
-                                        device_runtime->get_num_sms());     // tile 启发式
+                                        device_runtime->get_num_sms());     
+    // 3. config                                  
     auto config = GemmConfig{
         .layout = layout,
         .storage_config = SM100ArchSpec::get_storage_config(desc, layout),  // load/store 块、swizzle 模式
@@ -297,6 +301,7 @@ static void sm100_fp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa
     const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
                                                  config.layout.block_n, gran_k, 1, 0);
 
+    // 2. jit编译、launch
     // C is merged into D by the API's early_return() pre-launch; the kernel
     // has no separate C load path.
     const SM100FP4Gemm1D1DRuntime::Args args = {
